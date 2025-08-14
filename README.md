@@ -1,82 +1,164 @@
-### File Secure
+# Secure File Manager
 
-Simple CLI to encrypt an entire directory into a single zip file and decrypt it back later using a password-derived key.
+A production-level file encryption and decryption tool that can handle folders, subfolders, and individual files with robust security features.
 
-### Features
-- **AES-CBC encryption**: Encrypts every file in a directory.
-- **Zip packaging**: Produces a single `*_enc.zip` archive containing the encrypted files.
-- **Progress bar**: Uses `tqdm` for progress feedback.
+## Features
 
-### Requirements
-- **Python**: 3.8+
-- **Packages**: `pycryptodome`, `tqdm`
+- **Advanced Encryption**: AES-256-GCM with PBKDF2 key derivation (100,000 iterations)
+- **Folder Support**: Encrypts entire directory structures while preserving folder hierarchy
+- **Progress Tracking**: Real-time progress bars with detailed status information
+- **Integrity Verification**: Automatic verification of encrypted files
+- **Backup Protection**: Automatic backup of original files before encryption
+- **Archive Support**: Create encrypted ZIP archives for easy transport
+- **Memory Efficient**: Processes files in chunks to handle large files
+- **Cross-Platform**: Works on Windows, macOS, and Linux
 
-Install dependencies:
+## Requirements
+
+- Python 3.7+
+- `cryptography` - For encryption/decryption operations
+- `tqdm` - For progress bars
+
+## Installation
+
+1. **Create virtual environment:**
+   ```bash
+   python3 -m venv venv
+   source venv/bin/activate  # On Windows: venv\Scripts\activate
+   ```
+
+2. **Install dependencies:**
+   ```bash
+   pip install -r requirements.txt
+   ```
+
+3. **Verify installation:**
+   ```bash
+   python secure_file_manager.py --help
+   ```
+
+## Quick Start
+
+### Basic Usage
 
 ```bash
-python3 -m pip install --upgrade pip
-python3 -m pip install pycryptodome tqdm
+# Encrypt a directory
+python secure_file_manager.py encrypt /path/to/your/folder --password "your_secure_password"
+
+# Decrypt an encrypted directory
+python secure_file_manager.py decrypt /path/to/encrypted_folder --password "your_secure_password"
+
+# Create encrypted archive
+python secure_file_manager.py archive /path/to/your/folder --password "your_password"
+
+# Extract encrypted archive
+python secure_file_manager.py extract my_secure_archive.zip --password "your_password"
 ```
 
-### Usage
-The CLI entrypoint is `file_secure.py`.
+### Interactive Mode
 
-General syntax:
+The script will prompt for password if not provided:
 
 ```bash
-python3 file_secure.py <mode> <path> <password>
-# modes: -e (encrypt), -d (decrypt)
+python secure_file_manager.py encrypt /path/to/folder
+# Will prompt: Enter password:
 ```
 
-- **Encrypt a directory**
+## Usage Examples
 
+### Encrypt with Custom Output
 ```bash
-python3 file_secure.py -e /path/to/my_folder myStrongPassword
+python secure_file_manager.py encrypt /path/to/folder --password "password" --output /path/to/output
 ```
 
-Result:
-- All files inside `/path/to/my_folder` are encrypted in place, then compressed into `/path/to/my_folder_enc.zip`.
-- The original directory `/path/to/my_folder` is deleted after compression.
-
-- **Decrypt an archive**
-
+### Use Key File Instead of Password
 ```bash
-python3 file_secure.py -d /path/to/my_folder_enc.zip myStrongPassword
+# Create a key file (store securely!)
+echo "your_secure_password" > my_key.txt
+
+# Use the key file
+python secure_file_manager.py encrypt /path/to/folder --key-file my_key.txt
 ```
 
-Result:
-- The archive is extracted next to the zip, and each file is decrypted back to its original content.
+### Skip Backup (Not Recommended)
+```bash
+python secure_file_manager.py encrypt /path/to/folder --password "password" --no-backup
+```
 
-### How it works (high level)
-- The key is derived from your password by computing SHA-256, taking the first 16 hex characters, and using those bytes as a 16-byte AES key.
-- During encryption, a single random 16-byte IV is generated per run and prepended to every encrypted file's bytes. Files are then zipped and the original directory is removed.
-- During decryption, files are read from the extracted directory, their first 16 bytes are used as the IV, and the rest is decrypted.
+### Verbose Logging
+```bash
+python secure_file_manager.py encrypt /path/to/folder --password "password" --verbose
+```
 
-### Important notes and limitations
-- **Destructive behavior**: After encryption, the original directory is deleted. Work on a copy if you are experimenting.
-- **Key derivation**: No salt or KDF iterations are used. The key is derived as ASCII bytes of the first 16 hex chars of SHA-256(password), which is a 128-bit key but not a standard KDF like PBKDF2/scrypt/Argon2.
-- **IV reuse per run**: One IV is generated for the entire encryption run and prepended to each file. This is functional for decryption but not ideal cryptographically; unique IVs per file are recommended for stronger security.
-- **No integrity/authentication**: AES-CBC without an authentication tag does not detect tampering. Consider an AEAD mode (e.g., AES-GCM) for integrity.
-- **Supported inputs**: Encryption expects a directory path. Decryption expects a zip path that ends with `_enc.zip`.
-- **Hidden/system files**: Files named `.DS_Store` are skipped; other files (including hidden ones) are processed.
+## Security Features
 
-### Troubleshooting
-- "Select Proper Mode!": Use `-e` to encrypt a directory or `-d` to decrypt a `*_enc.zip` file.
-- "Give proper Zip": Ensure the path you pass to `-d` ends with `_enc.zip` and exists.
-- Wrong password: Decryption will fail and the partially extracted directory is removed to avoid leaving corrupted data.
+- **AES-256-GCM**: Military-grade encryption with authentication
+- **PBKDF2**: 100,000 iterations prevent brute force attacks
+- **Unique salts**: Each file gets a unique salt
+- **Unique IVs**: Each file gets a unique initialization vector
+- **Integrity verification**: Automatic verification of encrypted files
 
-### Project structure
-- `file_secure.py`: CLI entrypoint (argument parsing, key creation, routing to encrypt/decrypt).
-- `encrypt.py`: Encrypts files in the given directory, prepends IV, zips the result, deletes the original directory.
-- `decrypt.py`: Decompresses the zip, reads IV from each file, and decrypts the contents.
+## Important Notes
 
-### Roadmap (ideas)
-- Switch to a standard KDF (PBKDF2/scrypt/Argon2) with salt and iterations.
-- Use per-file random IVs and authenticated encryption (AES-GCM/ChaCha20-Poly1305).
-- Add a non-destructive mode that keeps originals.
-- Add `--help` and safer CLI UX with confirmations.
-- Provide a `requirements.txt` and tests.
+### Security
+- **Never share your password** - it's the only way to decrypt your files
+- **Keep backups** - the tool creates automatic backups, but maintain additional backups
+- **Store passwords securely** - consider using a password manager
+- **Test decryption** - always verify you can decrypt before deleting originals
 
-### Disclaimer
-This tool is for educational and light personal use. It is not audited for production security. Use at your own risk and keep backups of your data.
+### File Handling
+- **All files are encrypted** - including hidden files (starting with `.`)
+- **Large files are supported** - processed in 64KB chunks for memory efficiency
+- **Folder structure is preserved** - relative paths are maintained
+- **Original files are backed up** - unless `--no-backup` is specified
 
+## Troubleshooting
+
+### Common Issues
+
+1. **Import Error for cryptography**
+   ```bash
+   pip install cryptography
+   ```
+
+2. **Import Error for tqdm**
+   ```bash
+   pip install tqdm
+   ```
+
+3. **Permission Denied**
+   - Ensure you have read/write permissions for source and destination directories
+   - On Windows, run as Administrator if needed
+
+4. **Decryption Fails**
+   - Verify the password is correct
+   - Check that the encrypted files are not corrupted
+   - Ensure you're using the same version of the tool for encryption and decryption
+
+## Project Structure
+
+```
+file_secure/
+├── secure_file_manager.py      # Main production script
+├── requirements.txt            # Dependencies
+├── README.md                  # This file
+├── config_example.py          # Configuration examples
+└── .gitignore                 # Git ignore rules
+```
+
+## Configuration
+
+The tool uses sensible defaults but can be customized. See `config_example.py` for various configuration options including:
+- High security configuration
+- Performance-focused configuration
+- Enterprise configuration
+- Embedded systems configuration
+- Cloud storage configuration
+
+## License
+
+This tool is provided as-is for educational and production use. Ensure you comply with all applicable laws and regulations regarding encryption in your jurisdiction.
+
+---
+
+**⚠️ Security Disclaimer**: While this tool uses industry-standard encryption algorithms, the security of your encrypted data ultimately depends on the strength of your password and the security of your system. Use strong, unique passwords and keep your system secure. 
