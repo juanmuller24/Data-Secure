@@ -6,48 +6,30 @@ Handles folders, subfolders, and individual files with robust security features.
 
 import os
 import sys
-import json
-import hashlib
-import argparse
 import logging
+import tempfile
 from pathlib import Path
-from typing import List, Optional, Dict, Any
+from typing import Dict, Any
 from dataclasses import dataclass
-from datetime import datetime
-import shutil
-import zipfile
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import threading
 
-# Cryptography imports
-try:
-    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-    from cryptography.hazmat.primitives import hashes, hmac
-    from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
-    from cryptography.hazmat.backends import default_backend
-    CRYPTOGRAPHY_AVAILABLE = True
-except ImportError:
-    CRYPTOGRAPHY_AVAILABLE = False
-    print("Warning: cryptography library not available. Install with: pip install cryptography")
-
-# Progress bar
-try:
-    from tqdm import tqdm
-    TQDM_AVAILABLE = True
-except ImportError:
-    TQDM_AVAILABLE = False
-    print("Warning: tqdm library not available. Install with: pip install tqdm")
+# Import our modular components
+from crypto_utils import CryptoManager, CryptoConfig
+from file_operations import FileOperations, FileOpsConfig
+from cli_interface import parse_arguments, get_password_from_args
 
 # Configuration
 @dataclass
 class Config:
     """Configuration settings for the encryption/decryption process."""
+    # Crypto settings
     CHUNK_SIZE: int = 64 * 1024  # 64KB chunks for memory efficiency
     SALT_SIZE: int = 32
     IV_SIZE: int = 16
     KEY_SIZE: int = 32
     TAG_SIZE: int = 16
     ITERATIONS: int = 100000  # PBKDF2 iterations
+    
+    # File operations settings
     MAX_WORKERS: int = 4  # Thread pool workers
     COMPRESSION_LEVEL: int = 6  # ZIP compression level
     BACKUP_ORIGINAL: bool = True  # Keep original files as backup
@@ -59,10 +41,26 @@ class SecureFileManager:
     def __init__(self, config: Config = None):
         self.config = config or Config()
         self.logger = self._setup_logging()
-        self._lock = threading.Lock()
         
-        if not CRYPTOGRAPHY_AVAILABLE:
-            raise ImportError("cryptography library is required. Install with: pip install cryptography")
+        # Initialize components
+        crypto_config = CryptoConfig(
+            CHUNK_SIZE=self.config.CHUNK_SIZE,
+            SALT_SIZE=self.config.SALT_SIZE,
+            IV_SIZE=self.config.IV_SIZE,
+            KEY_SIZE=self.config.KEY_SIZE,
+            TAG_SIZE=self.config.TAG_SIZE,
+            ITERATIONS=self.config.ITERATIONS
+        )
+        
+        file_ops_config = FileOpsConfig(
+            MAX_WORKERS=self.config.MAX_WORKERS,
+            COMPRESSION_LEVEL=self.config.COMPRESSION_LEVEL,
+            BACKUP_ORIGINAL=self.config.BACKUP_ORIGINAL,
+            VERIFY_INTEGRITY=self.config.VERIFY_INTEGRITY
+        )
+        
+        self.crypto_manager = CryptoManager(crypto_config)
+        self.file_ops = FileOperations(file_ops_config)
     
     def _setup_logging(self) -> logging.Logger:
         """Setup logging configuration."""
@@ -80,174 +78,8 @@ class SecureFileManager:
         
         return logger
     
-    def derive_key(self, password: str, salt: bytes) -> bytes:
-        """Derive encryption key from password using PBKDF2."""
-        kdf = PBKDF2HMAC(
-            algorithm=hashes.SHA256(),
-            length=self.config.KEY_SIZE,
-            salt=salt,
-            iterations=self.config.ITERATIONS,
-            backend=default_backend()
-        )
-        return kdf.derive(password.encode('utf-8'))
-    
-    def generate_salt(self) -> bytes:
-        """Generate random salt for key derivation."""
-        return os.urandom(self.config.SALT_SIZE)
-    
-    def generate_iv(self) -> bytes:
-        """Generate random initialization vector."""
-        return os.urandom(self.config.IV_SIZE)
-    
-    def encrypt_file(self, file_path: Path, password: str, output_dir: Path) -> Dict[str, Any]:
-        """Encrypt a single file with progress tracking and integrity verification."""
-        try:
-            # Generate cryptographic materials
-            salt = self.generate_salt()
-            iv = self.generate_iv()
-            key = self.derive_key(password, salt)
-            
-            # Setup encryption
-            cipher = Cipher(algorithms.AES(key), modes.GCM(iv), backend=default_backend())
-            encryptor = cipher.encryptor()
-            
-            # Prepare output file path
-            relative_path = file_path.relative_to(file_path.parts[0])
-            encrypted_file = output_dir / f"{relative_path}.enc"
-            encrypted_file.parent.mkdir(parents=True, exist_ok=True)
-            
-            # Read and encrypt file in chunks
-            file_size = file_path.stat().st_size
-            encrypted_size = 0
-            
-            with open(file_path, 'rb') as infile, open(encrypted_file, 'wb') as outfile:
-                # Write metadata header
-                header = {
-                    'salt': salt.hex(),
-                    'iv': iv.hex(),
-                    'original_name': file_path.name,
-                    'original_size': file_size,
-                    'timestamp': datetime.now().isoformat()
-                }
-                header_bytes = json.dumps(header).encode('utf-8')
-                header_length = len(header_bytes).to_bytes(4, 'big')
-                outfile.write(header_length)
-                outfile.write(header_bytes)
-                
-                # Encrypt file content
-                while True:
-                    chunk = infile.read(self.config.CHUNK_SIZE)
-                    if not chunk:
-                        break
-                    
-                    encrypted_chunk = encryptor.update(chunk)
-                    outfile.write(encrypted_chunk)
-                    encrypted_size += len(encrypted_chunk)
-                
-                # Finalize encryption and get tag
-                encryptor.finalize()
-                tag = encryptor.tag
-                outfile.write(tag)
-            
-            # Verify integrity
-            if self.config.VERIFY_INTEGRITY:
-                self._verify_encrypted_file(encrypted_file, password)
-            
-            return {
-                'status': 'success',
-                'original_file': str(file_path),
-                'encrypted_file': str(encrypted_file),
-                'original_size': file_size,
-                'encrypted_size': encrypted_file.stat().st_size,
-                'compression_ratio': (file_size / encrypted_file.stat().st_size) if encrypted_file.stat().st_size > 0 else 0
-            }
-            
-        except Exception as e:
-            self.logger.error(f"Error encrypting {file_path}: {str(e)}")
-            return {
-                'status': 'error',
-                'original_file': str(file_path),
-                'error': str(e)
-            }
-    
-    def decrypt_file(self, encrypted_file: Path, password: str, output_dir: Path) -> Dict[str, Any]:
-        """Decrypt a single encrypted file."""
-        try:
-            with open(encrypted_file, 'rb') as infile:
-                # Read header
-                header_length = int.from_bytes(infile.read(4), 'big')
-                header_bytes = infile.read(header_length)
-                header = json.loads(header_bytes.decode('utf-8'))
-                
-                # Extract cryptographic materials
-                salt = bytes.fromhex(header['salt'])
-                iv = bytes.fromhex(header['iv'])
-                original_name = header['original_name']
-                original_size = header['original_size']
-                
-                # Derive key
-                key = self.derive_key(password, salt)
-                
-                # Setup decryption
-                cipher = Cipher(algorithms.AES(key), modes.GCM(iv, tag=None), backend=default_backend())
-                decryptor = cipher.decryptor()
-                
-                # Prepare output file path
-                decrypted_file = output_dir / original_name
-                decrypted_file.parent.mkdir(parents=True, exist_ok=True)
-                
-                # Read and decrypt file content
-                encrypted_data = infile.read()
-                tag = encrypted_data[-self.config.TAG_SIZE:]
-                encrypted_content = encrypted_data[:-self.config.TAG_SIZE]
-                
-                # Decrypt
-                decrypted_content = decryptor.update(encrypted_content)
-                decryptor.finalize_with_tag(tag)
-                
-                # Write decrypted file
-                with open(decrypted_file, 'wb') as outfile:
-                    outfile.write(decrypted_content)
-                
-                # Verify size
-                if decrypted_file.stat().st_size != original_size:
-                    raise ValueError(f"Size mismatch: expected {original_size}, got {decrypted_file.stat().st_size}")
-                
-                return {
-                    'status': 'success',
-                    'encrypted_file': str(encrypted_file),
-                    'decrypted_file': str(decrypted_file),
-                    'original_size': original_size,
-                    'decrypted_size': decrypted_file.stat().st_size
-                }
-                
-        except Exception as e:
-            self.logger.error(f"Error decrypting {encrypted_file}: {str(e)}")
-            return {
-                'status': 'error',
-                'encrypted_file': str(encrypted_file),
-                'error': str(e)
-            }
-    
-    def _verify_encrypted_file(self, encrypted_file: Path, password: str) -> bool:
-        """Verify that an encrypted file can be decrypted."""
-        try:
-            # Create temporary directory for verification
-            temp_dir = Path(f"/tmp/secure_file_manager_verify_{os.getpid()}")
-            temp_dir.mkdir(exist_ok=True)
-            
-            # Attempt to decrypt
-            result = self.decrypt_file(encrypted_file, password, temp_dir)
-            
-            # Cleanup
-            shutil.rmtree(temp_dir)
-            
-            return result['status'] == 'success'
-        except Exception:
-            return False
-    
     def encrypt_directory(self, source_dir: Path, password: str, output_dir: Path = None) -> Dict[str, Any]:
-        """Encrypt an entire directory structure.
+        """Encrypt an entire directory structure using parallel processing.
         
         Note: This method encrypts ALL files including hidden files (starting with '.')
         and files inside hidden directories. Use with caution if you want to exclude
@@ -262,65 +94,80 @@ class SecureFileManager:
         output_dir.mkdir(parents=True, exist_ok=True)
         
         # Get all files to encrypt
-        files_to_encrypt = []
-        for root, dirs, files in os.walk(source_dir):
-            for file in files:
-                # No filtering - encrypt everything including hidden files
-                file_path = Path(root) / file
-                files_to_encrypt.append(file_path)
+        files_to_encrypt = self.file_ops.get_files_to_process(source_dir)
         
         if not files_to_encrypt:
             return {'status': 'warning', 'message': 'No files found to encrypt'}
         
         self.logger.info(f"Found {len(files_to_encrypt)} files to encrypt")
         
-        # Encrypt files with progress tracking
+        # Determine optimal chunk size based on number of files and workers
+        total_files = len(files_to_encrypt)
+        chunk_size = max(1, total_files // (self.config.MAX_WORKERS * 4))
+        
+        # Process files with parallel progress tracking
+        def encrypt_single_file(file_path: Path) -> Dict[str, Any]:
+            try:
+                import threading
+                thread_id = threading.current_thread().name
+                self.logger.info(f"Starting encryption of {file_path.name} on thread {thread_id}")
+                result = self.crypto_manager.encrypt_file(file_path, password, output_dir)
+                self.logger.info(f"Completed encryption of {file_path.name} on thread {thread_id}")
+                return {
+                    'status': 'success',
+                    'file': str(file_path),
+                    'thread': thread_id,
+                    'result': result
+                }
+            except Exception as e:
+                self.logger.error(f"Error encrypting {file_path.name}: {str(e)}")
+                return {
+                    'status': 'error',
+                    'file': str(file_path),
+                    'thread': threading.current_thread().name,
+                    'error': str(e)
+                }
+        
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        from tqdm import tqdm
+        
         results = []
-        successful = 0
-        failed = 0
-        
-        if TQDM_AVAILABLE:
-            pbar = tqdm(files_to_encrypt, desc="Encrypting files")
-        else:
-            pbar = files_to_encrypt
-        
-        for file_path in pbar:
-            result = self.encrypt_file(file_path, password, output_dir)
-            results.append(result)
+        with ThreadPoolExecutor(max_workers=self.config.MAX_WORKERS) as executor:
+            # Submit all tasks
+            future_to_file = {
+                executor.submit(encrypt_single_file, file_path): file_path 
+                for file_path in files_to_encrypt
+            }
             
-            if result['status'] == 'success':
-                successful += 1
-            else:
-                failed += 1
-            
-            if TQDM_AVAILABLE:
-                pbar.set_postfix({'Success': successful, 'Failed': failed})
+            # Track progress with tqdm
+            with tqdm(total=len(files_to_encrypt), desc="Encrypting files") as pbar:
+                for future in as_completed(future_to_file):
+                    result = future.result()
+                    results.append(result)
+                    pbar.update(1)
         
         # Create directory structure manifest
         manifest = {
             'source_directory': str(source_dir),
-            'encryption_date': datetime.now().isoformat(),
-            'total_files': len(files_to_encrypt),
-            'successful_encryptions': successful,
-            'failed_encryptions': failed,
-            'results': results
+            'encryption_date': self._get_timestamp(),
+            'total_files': result['total_files'],
+            'successful_encryptions': result['successful'],
+            'failed_encryptions': result['failed'],
+            'results': result['results']
         }
         
-        manifest_file = output_dir / 'encryption_manifest.json'
-        with open(manifest_file, 'w') as f:
-            json.dump(manifest, f, indent=2)
+        self.file_ops.create_manifest(manifest, output_dir, 'encryption_manifest.json')
         
         # Backup original if configured
         if self.config.BACKUP_ORIGINAL:
-            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S_%f')  # Include microseconds for uniqueness
-            backup_dir = source_dir.parent / f"{source_dir.name}_backup_{timestamp}"
-            shutil.copytree(source_dir, backup_dir)
-            self.logger.info(f"Original directory backed up to: {backup_dir}")
+            backup_dir = self.file_ops.create_backup(source_dir)
+            if backup_dir:
+                self.logger.info(f"Original directory backed up to: {backup_dir}")
         
         return manifest
     
-    def decrypt_directory(self, encrypted_dir: Path, password: str, output_dir: Path = None) -> Dict[str, Any]:
-        """Decrypt an entire encrypted directory structure."""
+    def decrypt_directory(self, encrypted_dir: Path, password: str, output_dir: Path | None = None) -> Dict[str, Any]:
+        """Decrypt an entire encrypted directory structure using parallel processing."""
         if not encrypted_dir.exists() or not encrypted_dir.is_dir():
             raise ValueError(f"Encrypted directory does not exist or is not a directory: {encrypted_dir}")
         
@@ -330,64 +177,75 @@ class SecureFileManager:
         output_dir.mkdir(parents=True, exist_ok=True)
         
         # Find all encrypted files
-        encrypted_files = []
-        for root, dirs, files in os.walk(encrypted_dir):
-            for file in files:
-                if file.endswith('.enc'):
-                    file_path = Path(root) / file
-                    encrypted_files.append(file_path)
+        encrypted_files = self.file_ops.get_encrypted_files(encrypted_dir)
         
         if not encrypted_files:
             return {'status': 'warning', 'message': 'No encrypted files found'}
         
         self.logger.info(f"Found {len(encrypted_files)} encrypted files to decrypt")
         
-        # Decrypt files with progress tracking
+        # Process files with parallel tracking
+        def decrypt_single_file(encrypted_file: Path) -> Dict[str, Any]:
+            try:
+                import threading
+                thread_id = threading.current_thread().name
+                self.logger.info(f"Starting decryption of {encrypted_file.name} on thread {thread_id}")
+                result = self.crypto_manager.decrypt_file(encrypted_file, password, output_dir)
+                self.logger.info(f"Completed decryption of {encrypted_file.name} on thread {thread_id}")
+                return {
+                    'status': 'success',
+                    'file': str(encrypted_file),
+                    'thread': thread_id,
+                    'result': result
+                }
+            except Exception as e:
+                self.logger.error(f"Error decrypting {encrypted_file.name}: {str(e)}")
+                return {
+                    'status': 'error',
+                    'file': str(encrypted_file),
+                    'thread': threading.current_thread().name,
+                    'error': str(e)
+                }
+        
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        from tqdm import tqdm
+        
         results = []
-        successful = 0
-        failed = 0
-        
-        if TQDM_AVAILABLE:
-            pbar = tqdm(encrypted_files, desc="Decrypting files")
-        else:
-            pbar = encrypted_files
-        
-        for encrypted_file in pbar:
-            result = self.decrypt_file(encrypted_file, password, output_dir)
-            results.append(result)
+        with ThreadPoolExecutor(max_workers=self.config.MAX_WORKERS) as executor:
+            # Submit all tasks
+            future_to_file = {
+                executor.submit(decrypt_single_file, encrypted_file): encrypted_file 
+                for encrypted_file in encrypted_files
+            }
             
-            if result['status'] == 'success':
-                successful += 1
-            else:
-                failed += 1
-            
-            if TQDM_AVAILABLE:
-                pbar.set_postfix({'Success': successful, 'Failed': failed})
+            # Track progress with tqdm
+            with tqdm(total=len(encrypted_files), desc="Decrypting files") as pbar:
+                for future in as_completed(future_to_file):
+                    result = future.result()
+                    results.append(result)
+                    pbar.update(1)
         
         # Create decryption manifest
         manifest = {
             'encrypted_directory': str(encrypted_dir),
-            'decryption_date': datetime.now().isoformat(),
-            'total_files': len(encrypted_files),
-            'successful_decryptions': successful,
-            'failed_decryptions': failed,
-            'results': results
+            'decryption_date': self._get_timestamp(),
+            'total_files': result['total_files'],
+            'successful_decryptions': result['successful'],
+            'failed_decryptions': result['failed'],
+            'results': result['results']
         }
         
-        manifest_file = output_dir / 'decryption_manifest.json'
-        with open(manifest_file, 'w') as f:
-            json.dump(manifest, f, indent=2)
+        self.file_ops.create_manifest(manifest, output_dir, 'decryption_manifest.json')
         
         return manifest
     
-    def create_archive(self, source_dir: Path, password: str, output_file: Path = None) -> Dict[str, Any]:
+    def create_archive(self, source_dir: Path, password: str, output_file: Path | None = None) -> Dict[str, Any]:
         """Create an encrypted archive of a directory."""
         if output_file is None:
             output_file = source_dir.parent / f"{source_dir.name}_secure.zip"
         
         # Create temporary directory for encrypted files
-        temp_dir = Path(f"/tmp/secure_file_manager_archive_{os.getpid()}")
-        temp_dir.mkdir(exist_ok=True)
+        temp_dir = Path(tempfile.mkdtemp(prefix="secure_file_manager_archive_"))
         
         try:
             # Encrypt the directory
@@ -397,30 +255,25 @@ class SecureFileManager:
                 return encrypt_result
             
             # Create ZIP archive
-            with zipfile.ZipFile(output_file, 'w', zipfile.ZIP_DEFLATED, compresslevel=self.config.COMPRESSION_LEVEL) as zipf:
-                for root, dirs, files in os.walk(temp_dir):
-                    for file in files:
-                        file_path = Path(root) / file
-                        arcname = file_path.relative_to(temp_dir)
-                        zipf.write(file_path, arcname)
+            archive_result = self.file_ops.create_archive(temp_dir, output_file)
             
-            # Cleanup temp directory
-            shutil.rmtree(temp_dir)
-            
-            return {
-                'status': 'success',
-                'archive_file': str(output_file),
-                'archive_size': output_file.stat().st_size,
-                'encryption_results': encrypt_result
-            }
+            if archive_result['status'] == 'success':
+                return {
+                    'status': 'success',
+                    'archive_file': archive_result['archive_file'],
+                    'archive_size': archive_result['archive_size'],
+                    'encryption_results': encrypt_result
+                }
+            else:
+                return archive_result
             
         except Exception as e:
-            # Cleanup on error
-            if temp_dir.exists():
-                shutil.rmtree(temp_dir)
             raise e
+        finally:
+            # Cleanup temp directory
+            self.file_ops.cleanup_temp_directory(temp_dir)
     
-    def extract_archive(self, archive_file: Path, password: str, output_dir: Path = None) -> Dict[str, Any]:
+    def extract_archive(self, archive_file: Path, password: str, output_dir: Path | None = None) -> Dict[str, Any]:
         """Extract and decrypt an encrypted archive."""
         if not archive_file.exists():
             raise ValueError(f"Archive file does not exist: {archive_file}")
@@ -431,95 +284,37 @@ class SecureFileManager:
         output_dir.mkdir(parents=True, exist_ok=True)
         
         # Create temporary directory for extraction
-        temp_dir = Path(f"/tmp/secure_file_manager_extract_{os.getpid()}")
-        temp_dir.mkdir(exist_ok=True)
+        temp_dir = Path(tempfile.mkdtemp(prefix="secure_file_manager_extract_"))
         
         try:
             # Extract archive
-            with zipfile.ZipFile(archive_file, 'r') as zipf:
-                zipf.extractall(temp_dir)
+            extract_result = self.file_ops.extract_archive(archive_file, temp_dir)
+            
+            if extract_result['status'] != 'success':
+                return extract_result
             
             # Decrypt the extracted directory
             decrypt_result = self.decrypt_directory(temp_dir, password, output_dir)
             
-            # Cleanup temp directory
-            shutil.rmtree(temp_dir)
-            
             return decrypt_result
             
         except Exception as e:
-            # Cleanup on error
-            if temp_dir.exists():
-                shutil.rmtree(temp_dir)
             raise e
+        finally:
+            # Cleanup temp directory
+            self.file_ops.cleanup_temp_directory(temp_dir)
+    
+    def _get_timestamp(self) -> str:
+        """Get current timestamp in ISO format."""
+        from datetime import datetime
+        return datetime.now().isoformat()
 
 def main():
     """Main CLI interface."""
-    parser = argparse.ArgumentParser(
-        description="Secure File Manager - Production Level File Encryption/Decryption Tool",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  # Encrypt a directory
-  python secure_file_manager.py encrypt /path/to/directory --password mypassword
-  
-  # Decrypt an encrypted directory
-  python secure_file_manager.py decrypt /path/to/encrypted_directory --password mypassword
-  
-  # Create encrypted archive
-  python secure_file_manager.py archive /path/to/directory --password mypassword
-  
-  # Extract encrypted archive
-  python secure_file_manager.py extract archive.zip --password mypassword
-  
-  # Encrypt with custom output directory
-  python secure_file_manager.py encrypt /path/to/directory --password mypassword --output /path/to/output
-  
-  # Use key file instead of password
-  python secure_file_manager.py encrypt /path/to/directory --key-file /path/to/keyfile
-        """
-    )
-    
-    subparsers = parser.add_subparsers(dest='command', help='Available commands')
-    
-    # Encrypt command
-    encrypt_parser = subparsers.add_parser('encrypt', help='Encrypt a directory or file')
-    encrypt_parser.add_argument('source', type=Path, help='Source directory or file to encrypt')
-    encrypt_parser.add_argument('--password', type=str, help='Encryption password')
-    encrypt_parser.add_argument('--key-file', type=Path, help='File containing encryption key')
-    encrypt_parser.add_argument('--output', type=Path, help='Output directory for encrypted files')
-    encrypt_parser.add_argument('--no-backup', action='store_true', help='Skip backing up original files')
-    
-    # Decrypt command
-    decrypt_parser = subparsers.add_parser('decrypt', help='Decrypt an encrypted directory or file')
-    decrypt_parser.add_argument('source', type=Path, help='Encrypted directory or file to decrypt')
-    decrypt_parser.add_argument('--password', type=str, help='Decryption password')
-    decrypt_parser.add_argument('--key-file', type=Path, help='File containing decryption key')
-    decrypt_parser.add_argument('--output', type=Path, help='Output directory for decrypted files')
-    
-    # Archive command
-    archive_parser = subparsers.add_parser('archive', help='Create encrypted archive')
-    archive_parser.add_argument('source', type=Path, help='Source directory to archive')
-    archive_parser.add_argument('--password', type=str, help='Encryption password')
-    archive_parser.add_argument('--key-file', type=Path, help='File containing encryption key')
-    archive_parser.add_argument('--output', type=Path, help='Output archive file')
-    
-    # Extract command
-    extract_parser = subparsers.add_parser('extract', help='Extract encrypted archive')
-    extract_parser.add_argument('source', type=Path, help='Archive file to extract')
-    extract_parser.add_argument('--password', type=str, help='Decryption password')
-    extract_parser.add_argument('--key-file', type=Path, help='File containing decryption key')
-    extract_parser.add_argument('--output', type=Path, help='Output directory for extracted files')
-    
-    # Global options
-    parser.add_argument('--verbose', '-v', action='store_true', help='Enable verbose logging')
-    parser.add_argument('--config', type=Path, help='Configuration file path')
-    
-    args = parser.parse_args()
-    
-    if not args.command:
-        parser.print_help()
-        return
+    # Parse arguments
+    args = parse_arguments()
+    if args is None:
+        return 1
     
     # Setup logging
     if args.verbose:
@@ -531,20 +326,10 @@ Examples:
         # Load custom config if provided
         pass  # Implementation for custom config loading
     
-    # Get password/key
-    password = None
-    if args.password:
-        password = args.password
-    elif args.key_file and args.key_file.exists():
-        with open(args.key_file, 'r') as f:
-            password = f.read().strip()
-    else:
-        import getpass
-        password = getpass.getpass("Enter password: ")
-    
+    # Get password
+    password = get_password_from_args(args)
     if not password:
-        print("Error: No password or key file provided")
-        return
+        return 1
     
     # Initialize manager
     try:
@@ -552,7 +337,7 @@ Examples:
     except ImportError as e:
         print(f"Error: {e}")
         print("Install required dependencies with: pip install cryptography tqdm")
-        return
+        return 1
     
     # Execute command
     try:
@@ -561,7 +346,7 @@ Examples:
                 config.BACKUP_ORIGINAL = False
             
             if args.source.is_file():
-                result = manager.encrypt_file(args.source, password, args.output or args.source.parent)
+                result = manager.crypto_manager.encrypt_file(args.source, password, args.output or args.source.parent)
             else:
                 result = manager.encrypt_directory(args.source, password, args.output)
             
@@ -569,7 +354,7 @@ Examples:
             
         elif args.command == 'decrypt':
             if args.source.is_file():
-                result = manager.decrypt_file(args.source, password, args.output or args.source.parent)
+                result = manager.crypto_manager.decrypt_file(args.source, password, args.output or args.source.parent)
             else:
                 result = manager.decrypt_directory(args.source, password, args.output)
             

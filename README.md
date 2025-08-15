@@ -139,12 +139,24 @@ python secure_file_manager.py encrypt /path/to/folder --password "password" --ve
 
 ```
 file_secure/
-├── secure_file_manager.py      # Main production script
+├── secure_file_manager.py      # Main production script (315 lines)
+├── crypto_utils.py             # Cryptographic operations (185 lines)
+├── file_operations.py          # File operations and utilities (147 lines)
+├── cli_interface.py            # Command-line interface (120 lines)
 ├── requirements.txt            # Dependencies
 ├── README.md                  # This file
 ├── config_example.py          # Configuration examples
 └── .gitignore                 # Git ignore rules
 ```
+
+## Architecture
+
+The project is organized into modular components:
+
+- **`secure_file_manager.py`**: Main orchestrator class and CLI entry point
+- **`crypto_utils.py`**: Cryptographic operations (encryption, decryption, key derivation)
+- **`file_operations.py`**: File system operations (backup, archive, progress tracking)
+- **`cli_interface.py`**: Command-line argument parsing and validation
 
 ## Configuration
 
