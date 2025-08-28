@@ -101,17 +101,19 @@ class SecureFileManager:
         
         self.logger.info(f"Found {len(files_to_encrypt)} files to encrypt")
         
-        # Determine optimal chunk size based on number of files and workers
-        total_files = len(files_to_encrypt)
-        chunk_size = max(1, total_files // (self.config.MAX_WORKERS * 4))
-        
         # Process files with parallel progress tracking
         def encrypt_single_file(file_path: Path) -> Dict[str, Any]:
             try:
                 import threading
                 thread_id = threading.current_thread().name
                 self.logger.info(f"Starting encryption of {file_path.name} on thread {thread_id}")
-                result = self.crypto_manager.encrypt_file(file_path, password, output_dir)
+                result = self.crypto_manager.encrypt_file(
+                    file_path,
+                    password,
+                    output_dir,
+                    base_dir=source_dir,
+                    verify_integrity=self.config.VERIFY_INTEGRITY,
+                )
                 self.logger.info(f"Completed encryption of {file_path.name} on thread {thread_id}")
                 return {
                     'status': 'success',
@@ -133,27 +135,29 @@ class SecureFileManager:
         
         results = []
         with ThreadPoolExecutor(max_workers=self.config.MAX_WORKERS) as executor:
-            # Submit all tasks
             future_to_file = {
                 executor.submit(encrypt_single_file, file_path): file_path 
                 for file_path in files_to_encrypt
             }
             
-            # Track progress with tqdm
             with tqdm(total=len(files_to_encrypt), desc="Encrypting files") as pbar:
                 for future in as_completed(future_to_file):
-                    result = future.result()
-                    results.append(result)
+                    res = future.result()
+                    results.append(res)
                     pbar.update(1)
         
-        # Create directory structure manifest
+        # Aggregate results
+        total_files = len(results)
+        successful = sum(1 for r in results if r.get('result', {}).get('status') == 'success')
+        failed = total_files - successful
+        
         manifest = {
             'source_directory': str(source_dir),
             'encryption_date': self._get_timestamp(),
-            'total_files': result['total_files'],
-            'successful_encryptions': result['successful'],
-            'failed_encryptions': result['failed'],
-            'results': result['results']
+            'total_files': total_files,
+            'successful_encryptions': successful,
+            'failed_encryptions': failed,
+            'results': results
         }
         
         self.file_ops.create_manifest(manifest, output_dir, 'encryption_manifest.json')
@@ -190,7 +194,12 @@ class SecureFileManager:
                 import threading
                 thread_id = threading.current_thread().name
                 self.logger.info(f"Starting decryption of {encrypted_file.name} on thread {thread_id}")
-                result = self.crypto_manager.decrypt_file(encrypted_file, password, output_dir)
+                result = self.crypto_manager.decrypt_file(
+                    encrypted_file,
+                    password,
+                    output_dir,
+                    verify_integrity=self.config.VERIFY_INTEGRITY,
+                )
                 self.logger.info(f"Completed decryption of {encrypted_file.name} on thread {thread_id}")
                 return {
                     'status': 'success',
@@ -212,27 +221,29 @@ class SecureFileManager:
         
         results = []
         with ThreadPoolExecutor(max_workers=self.config.MAX_WORKERS) as executor:
-            # Submit all tasks
             future_to_file = {
                 executor.submit(decrypt_single_file, encrypted_file): encrypted_file 
                 for encrypted_file in encrypted_files
             }
             
-            # Track progress with tqdm
             with tqdm(total=len(encrypted_files), desc="Decrypting files") as pbar:
                 for future in as_completed(future_to_file):
-                    result = future.result()
-                    results.append(result)
+                    res = future.result()
+                    results.append(res)
                     pbar.update(1)
         
-        # Create decryption manifest
+        # Aggregate results
+        total_files = len(results)
+        successful = sum(1 for r in results if r.get('result', {}).get('status') == 'success')
+        failed = total_files - successful
+        
         manifest = {
             'encrypted_directory': str(encrypted_dir),
             'decryption_date': self._get_timestamp(),
-            'total_files': result['total_files'],
-            'successful_decryptions': result['successful'],
-            'failed_decryptions': result['failed'],
-            'results': result['results']
+            'total_files': total_files,
+            'successful_decryptions': successful,
+            'failed_decryptions': failed,
+            'results': results
         }
         
         self.file_ops.create_manifest(manifest, output_dir, 'decryption_manifest.json')
@@ -346,7 +357,11 @@ def main():
                 config.BACKUP_ORIGINAL = False
             
             if args.source.is_file():
-                result = manager.crypto_manager.encrypt_file(args.source, password, args.output or args.source.parent)
+                result = manager.crypto_manager.encrypt_file(
+                    args.source, password, args.output or args.source.parent,
+                    base_dir=args.source.parent,
+                    verify_integrity=config.VERIFY_INTEGRITY,
+                )
             else:
                 result = manager.encrypt_directory(args.source, password, args.output)
             
@@ -354,7 +369,10 @@ def main():
             
         elif args.command == 'decrypt':
             if args.source.is_file():
-                result = manager.crypto_manager.decrypt_file(args.source, password, args.output or args.source.parent)
+                result = manager.crypto_manager.decrypt_file(
+                    args.source, password, args.output or args.source.parent,
+                    verify_integrity=config.VERIFY_INTEGRITY,
+                )
             else:
                 result = manager.decrypt_directory(args.source, password, args.output)
             
@@ -378,4 +396,4 @@ def main():
     return 0
 
 if __name__ == '__main__':
-    sys.exit(main()) 
+    sys.exit(main())
